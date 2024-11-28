@@ -81,9 +81,9 @@ namespace Orm
 
             throw new NotSupportedException($"Type {type.Name} is not supported.");
         }
-    
 
-    public void GenerateModelsFromDatabase(string outputPath)
+
+        public void GenerateModelsFromDatabase(string outputPath)
         {
             using (var connection = new SqlConnection(_connectionString))
             {
@@ -264,6 +264,22 @@ namespace Orm
                 }
             }
         }
+        private string MapClrTypeToSqlType(Type clrType)
+        {
+            if (clrType == typeof(int))
+                return "INT";
+            if (clrType == typeof(string))
+                return "NVARCHAR(MAX)";
+            if (clrType == typeof(DateTime))
+                return "DATETIME";
+            if (clrType == typeof(bool))
+                return "BIT";
+            if (clrType == typeof(decimal) || clrType == typeof(double) || clrType == typeof(float))
+                return "DECIMAL";
+
+            throw new NotSupportedException($"Unsupported CLR type: {clrType.FullName}");
+        }
+
         public void MigrateDatabase<T>() where T : class
         {
             var tableAttribute = typeof(T).GetCustomAttribute<TableAttribute>();
@@ -282,10 +298,29 @@ namespace Orm
                 // Get model properties
                 var modelProperties = typeof(T).GetProperties()
                     .Where(p => p.GetCustomAttribute<ColumnAttribute>() != null)
-                    .ToList();
+                    .ToList(); // Keep as List<PropertyInfo>
 
                 // Generate migration SQL
-                var migrationSql = GenerateMigrationSql(tableName, existingColumns, modelProperties);
+                var migrationSql = GenerateMigrationSql(tableName, existingColumns, modelProperties, connection);
+
+                // Handle foreign keys if altering a primary key
+                var primaryKeyProperty = modelProperties.FirstOrDefault(p => p.GetCustomAttribute<ColumnAttribute>()?.IsPrimaryKey == true);
+
+                if (primaryKeyProperty != null)
+                {
+                    var primaryKeyColumn = primaryKeyProperty.GetCustomAttribute<ColumnAttribute>().Name;
+                    var foreignKeyCommands = new List<string>();
+                    HandleForeignKeys(tableName, primaryKeyColumn, connection, foreignKeyCommands);
+
+                    // Execute foreign key commands
+                    foreach (var cmd in foreignKeyCommands)
+                    {
+                        using (var command = new SqlCommand(cmd, connection))
+                        {
+                            command.ExecuteNonQuery();
+                        }
+                    }
+                }
 
                 // Execute migration SQL
                 if (!string.IsNullOrWhiteSpace(migrationSql))
@@ -298,50 +333,219 @@ namespace Orm
             }
         }
 
-        private List<(string Name, string Type)> GetExistingColumns(string tableName, SqlConnection connection)
-        {
-            var columns = new List<(string Name, string Type)>();
-            string columnQuery = $"SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{tableName}'";
 
-            using (var command = new SqlCommand(columnQuery, connection))
-            using (var reader = command.ExecuteReader())
+        private List<string> CompareSchema(string tableName, List<(string Name, string Type)> existingColumns, List<PropertyInfo> modelProperties, SqlConnection connection)
+        {
+            var modelColumns = modelProperties.Select(p => new
             {
-                while (reader.Read())
+                Name = p.GetCustomAttribute<ColumnAttribute>().Name,
+                Type = GetSqlType(p.PropertyType),
+                IsPrimaryKey = p.GetCustomAttribute<ColumnAttribute>().IsPrimaryKey
+            }).ToList();
+
+            var commands = new List<string>();
+
+            // Detect missing or altered columns
+            foreach (var modelColumn in modelColumns)
+            {
+                var existingColumn = existingColumns.FirstOrDefault(c => c.Name == modelColumn.Name);
+
+                if (existingColumn == default)
                 {
-                    columns.Add((reader.GetString(0), reader.GetString(1)));
+                    // Column missing in database
+                    commands.Add($"ALTER TABLE {tableName} ADD {modelColumn.Name} {modelColumn.Type}");
+                }
+                else if (existingColumn.Type != modelColumn.Type)
+                {
+                    // Column type mismatch
+                    commands.Add($"ALTER TABLE {tableName} ALTER COLUMN {modelColumn.Name} {modelColumn.Type}");
                 }
             }
 
-            return columns;
+            // Detect columns in database but not in the model
+            foreach (var existingColumn in existingColumns)
+            {
+                if (!modelColumns.Any(mc => mc.Name == existingColumn.Name))
+                {
+                    // Drop column (requires constraints to be handled)
+                    commands.Add($"ALTER TABLE {tableName} DROP COLUMN {existingColumn.Name}");
+                }
+            }
+
+            return commands;
         }
 
-        private string GenerateMigrationSql(string tableName, List<(string Name, string Type)> existingColumns, List<PropertyInfo> modelProperties)
+        private List<(string Name, string Type, bool IsNullable)> GetExistingColumns(string tableName, SqlConnection connection)
+        {
+            var existingColumns = new List<(string Name, string Type, bool IsNullable)>();
+
+            string query = $@"
+    SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE 
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = @TableName";
+
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@TableName", tableName);
+
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        string columnName = reader["COLUMN_NAME"].ToString();
+                        string columnType = reader["DATA_TYPE"].ToString();
+                        bool isNullable = reader["IS_NULLABLE"].ToString() == "YES";
+
+                        existingColumns.Add((columnName, columnType, isNullable));
+                    }
+                }
+            }
+
+            return existingColumns;
+        }
+        private List<(string ConstraintName, string Type)> GetConstraints(string tableName, SqlConnection connection)
+        {
+            var constraints = new List<(string ConstraintName, string Type)>();
+            string query = @"
+        SELECT CONSTRAINT_NAME, CONSTRAINT_TYPE 
+        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS 
+        WHERE TABLE_NAME = @TableName";
+
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@TableName", tableName);
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        constraints.Add((reader.GetString(0), reader.GetString(1)));
+                    }
+                }
+            }
+            return constraints;
+        }
+
+        private (string ConstraintName, string ColumnName) GetPrimaryKeyConstraint(string tableName, SqlConnection connection)
+        {
+            var query = @"
+        SELECT 
+            kcu.COLUMN_NAME, 
+            tc.CONSTRAINT_NAME 
+        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
+        JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS kcu
+        ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+        WHERE tc.TABLE_NAME = @TableName AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'";
+
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@TableName", tableName);
+                using (var reader = command.ExecuteReader())
+                {
+                    if (reader.Read())
+                    {
+                        return (reader["CONSTRAINT_NAME"].ToString(), reader["COLUMN_NAME"].ToString());
+                    }
+                }
+            }
+
+            return (null, null); // No primary key found
+        }
+        private string GenerateMigrationSql(string tableName, List<(string Name, string Type, bool IsNullable)> existingColumns, List<PropertyInfo> modelProperties, SqlConnection connection)
         {
             var modelColumns = modelProperties
-                .Select(p => (Name: p.GetCustomAttribute<ColumnAttribute>().Name, Type: GetSqlType(p.PropertyType), IsPrimaryKey: p.GetCustomAttribute<ColumnAttribute>().IsPrimaryKey))
+                .Select(p => (
+                    Name: p.GetCustomAttribute<ColumnAttribute>().Name,
+                    Type: GetSqlType(p.PropertyType),
+                    IsPrimaryKey: p.GetCustomAttribute<ColumnAttribute>().IsPrimaryKey,
+                    IsNullable: !p.PropertyType.IsValueType || Nullable.GetUnderlyingType(p.PropertyType) != null
+                ))
                 .ToList();
 
-            var addColumns = modelColumns
-                .Where(mc => !existingColumns.Any(ec => ec.Name == mc.Name))
-                .Select(mc => $"ALTER TABLE {tableName} ADD {mc.Name} {mc.Type}");
+            var commands = new List<string>();
 
-            var dropColumns = existingColumns
-                .Where(ec => !modelColumns.Any(mc => mc.Name == ec.Name))
-                .Select(ec => $"ALTER TABLE {tableName} DROP COLUMN {ec.Name}");
+            // Step 1: Drop foreign key constraints if altering primary key or column dependencies
+            var (constraintName, primaryKeyColumn) = GetPrimaryKeyConstraint(tableName, connection);
+            if (!string.IsNullOrEmpty(constraintName))
+            {
+                commands.Add($"ALTER TABLE {tableName} DROP CONSTRAINT {constraintName}");
+            }
 
-            var modifyColumns = modelColumns
-                .Where(mc => existingColumns.Any(ec => ec.Name == mc.Name && ec.Type != mc.Type))
-                .Select(mc =>
+            var foreignKeyCommands = new List<string>();
+            foreach (var modelColumn in modelColumns)
+            {
+                if (modelColumn.IsPrimaryKey)
                 {
-                    var primaryKeyDrop = mc.IsPrimaryKey ? $"ALTER TABLE {tableName} DROP CONSTRAINT PK_{tableName}; " : "";
-                    return $"{primaryKeyDrop}ALTER TABLE {tableName} ALTER COLUMN {mc.Name} {mc.Type}";
-                });
+                    HandleForeignKeys(tableName, modelColumn.Name, connection, foreignKeyCommands);
+                }
+            }
+            commands.AddRange(foreignKeyCommands);
 
-            var primaryKeyCommands = modelColumns
-                .Where(mc => mc.IsPrimaryKey)
-                .Select(mc => $"ALTER TABLE {tableName} ADD CONSTRAINT PK_{tableName} PRIMARY KEY ({mc.Name})");
+            // Step 2: Alter existing columns or add missing ones
+            foreach (var modelColumn in modelColumns)
+            {
+                var existingColumn = existingColumns.FirstOrDefault(ec => ec.Name == modelColumn.Name);
+                if (existingColumn != default)
+                {
+                    // Update column type or nullability
+                    if (existingColumn.Type != modelColumn.Type || existingColumn.IsNullable != modelColumn.IsNullable)
+                    {
+                        commands.Add($"ALTER TABLE {tableName} ALTER COLUMN {modelColumn.Name} {modelColumn.Type} {(modelColumn.IsNullable ? "NULL" : "NOT NULL")}");
+                    }
+                }
+                else
+                {
+                    // Add missing column
+                    commands.Add($"ALTER TABLE {tableName} ADD {modelColumn.Name} {modelColumn.Type} {(modelColumn.IsNullable ? "NULL" : "NOT NULL")}");
+                }
+            }
 
-            return string.Join("; ", addColumns.Concat(dropColumns).Concat(modifyColumns).Concat(primaryKeyCommands));
+            // Step 3: Recreate primary key
+            if (!string.IsNullOrEmpty(primaryKeyColumn))
+            {
+                commands.Add($"ALTER TABLE {tableName} ADD CONSTRAINT PK_{tableName} PRIMARY KEY ({primaryKeyColumn})");
+            }
+
+            // Step 4: Recreate foreign key constraints
+            foreach (var fkCommand in foreignKeyCommands)
+            {
+                commands.Add(fkCommand);
+            }
+
+            return string.Join("; ", commands);
+        }
+
+        private void HandleForeignKeys(string tableName, string columnName, SqlConnection connection, List<string> commands)
+        {
+            string query = @"
+SELECT rc.CONSTRAINT_NAME, fk.TABLE_NAME, fk.COLUMN_NAME
+FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE fk
+ON rc.CONSTRAINT_NAME = fk.CONSTRAINT_NAME
+WHERE rc.UNIQUE_CONSTRAINT_NAME = (
+    SELECT CONSTRAINT_NAME 
+    FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+    WHERE TABLE_NAME = @TableName AND CONSTRAINT_TYPE = 'PRIMARY KEY'
+)";
+
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@TableName", tableName);
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        string fkConstraint = reader["CONSTRAINT_NAME"].ToString();
+                        string fkTable = reader["TABLE_NAME"].ToString();
+                        string fkColumn = reader["COLUMN_NAME"].ToString();
+
+                        // Drop the foreign key constraint
+                        commands.Add($"ALTER TABLE {fkTable} DROP CONSTRAINT {fkConstraint}");
+
+                        // Save the constraint for recreation
+                        commands.Add($"ALTER TABLE {fkTable} ADD CONSTRAINT {fkConstraint} FOREIGN KEY ({fkColumn}) REFERENCES {tableName} ({columnName})");
+                    }
+                }
+            }
         }
 
 
