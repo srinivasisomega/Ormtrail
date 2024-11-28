@@ -73,14 +73,22 @@ namespace Orm
         // Add the GetSqlType method to map C# types to SQL types
         private string GetSqlType(Type type)
         {
-            if (type == typeof(int)) return "INT";
-            if (type == typeof(string)) return "NVARCHAR(MAX)";
-            if (type == typeof(bool)) return "BIT";
-            if (type == typeof(DateTime)) return "DATETIME";
-            // Add more type mappings as needed
+            if (Nullable.GetUnderlyingType(type) != null)
+                type = Nullable.GetUnderlyingType(type);
 
-            throw new NotSupportedException($"Type {type.Name} is not supported.");
+            return type switch
+            {
+                var t when t == typeof(int) => "INT",
+                var t when t == typeof(long) => "BIGINT",
+                var t when t == typeof(decimal) => "DECIMAL(18,2)",
+                var t when t == typeof(double) => "FLOAT",
+                var t when t == typeof(string) => "NVARCHAR(MAX)",
+                var t when t == typeof(bool) => "BIT",
+                var t when t == typeof(DateTime) => "DATETIME",
+                _ => throw new InvalidOperationException($"Unsupported type {type.Name}")
+            };
         }
+
 
 
         public void GenerateModelsFromDatabase(string outputPath)
@@ -334,12 +342,13 @@ namespace Orm
         }
 
 
-        private List<string> CompareSchema(string tableName, List<(string Name, string Type)> existingColumns, List<PropertyInfo> modelProperties, SqlConnection connection)
+        private List<string> CompareSchema(string tableName, List<(string Name, string Type, bool IsNullable)> existingColumns, List<PropertyInfo> modelProperties, SqlConnection connection)
         {
             var modelColumns = modelProperties.Select(p => new
             {
                 Name = p.GetCustomAttribute<ColumnAttribute>().Name,
                 Type = GetSqlType(p.PropertyType),
+                IsNullable = !p.PropertyType.IsValueType || Nullable.GetUnderlyingType(p.PropertyType) != null,
                 IsPrimaryKey = p.GetCustomAttribute<ColumnAttribute>().IsPrimaryKey
             }).ToList();
 
@@ -353,12 +362,12 @@ namespace Orm
                 if (existingColumn == default)
                 {
                     // Column missing in database
-                    commands.Add($"ALTER TABLE {tableName} ADD {modelColumn.Name} {modelColumn.Type}");
+                    commands.Add($"ALTER TABLE {tableName} ADD {modelColumn.Name} {modelColumn.Type} {(modelColumn.IsNullable ? "NULL" : "NOT NULL")}");
                 }
-                else if (existingColumn.Type != modelColumn.Type)
+                else if (existingColumn.Type != modelColumn.Type || existingColumn.IsNullable != modelColumn.IsNullable)
                 {
-                    // Column type mismatch
-                    commands.Add($"ALTER TABLE {tableName} ALTER COLUMN {modelColumn.Name} {modelColumn.Type}");
+                    // Column type mismatch or nullability mismatch
+                    commands.Add($"ALTER TABLE {tableName} ALTER COLUMN {modelColumn.Name} {modelColumn.Type} {(modelColumn.IsNullable ? "NULL" : "NOT NULL")}");
                 }
             }
 
@@ -374,15 +383,11 @@ namespace Orm
 
             return commands;
         }
-
         private List<(string Name, string Type, bool IsNullable)> GetExistingColumns(string tableName, SqlConnection connection)
         {
             var existingColumns = new List<(string Name, string Type, bool IsNullable)>();
 
-            string query = $@"
-    SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE 
-    FROM INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_NAME = @TableName";
+            string query = $@"SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @TableName";
 
             using (var command = new SqlCommand(query, connection))
             {
@@ -516,12 +521,7 @@ namespace Orm
 
         private void HandleForeignKeys(string tableName, string columnName, SqlConnection connection, List<string> commands)
         {
-            string query = @"
-SELECT rc.CONSTRAINT_NAME, fk.TABLE_NAME, fk.COLUMN_NAME
-FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
-JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE fk
-ON rc.CONSTRAINT_NAME = fk.CONSTRAINT_NAME
-WHERE rc.UNIQUE_CONSTRAINT_NAME = (
+            string query = @"SELECT rc.CONSTRAINT_NAME, fk.TABLE_NAME, fk.COLUMN_NAME FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE fk ON rc.CONSTRAINT_NAME = fk.CONSTRAINT_NAME WHERE rc.UNIQUE_CONSTRAINT_NAME = (
     SELECT CONSTRAINT_NAME 
     FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
     WHERE TABLE_NAME = @TableName AND CONSTRAINT_TYPE = 'PRIMARY KEY'
